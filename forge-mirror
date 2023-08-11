@@ -1,0 +1,81 @@
+#!/usr/bin/env ruby
+require 'json'
+require 'typhoeus'
+require 'thor'
+require 'digest'
+require 'fileutils'
+require 'uri'
+require 'ruby-progressbar'
+
+class PuppetForgeMirror < Thor
+  MODULE_PAGE_SIZE = 100
+
+  class_option :concurrency, aliases: "-c", type: :numeric, default: 5, desc: "Concurrency level (default: 5)"
+  class_option :source, aliases: "-s", type: :string, default: "https://forgeapi.puppet.com", desc: "The source forge to download the modules from"
+
+  desc "DOWNLOAD_DIR", "Mirror all the current releases from forge.puppet.com to the specified DOWNLOAD_DIR"
+  def mirror(download_dir)
+    Dir.mkdir(download_dir) unless File.exist?(download_dir)
+    forge_uri = URI.parse(options[:source])
+
+    total_modules = JSON.parse(Typhoeus.get(forge_uri.merge("/v3/modules?limit=1")).body)["pagination"]["total"]
+    puts "Will download #{total_modules} modules"
+
+    total_pages = (total_modules.to_f / MODULE_PAGE_SIZE).ceil
+    index_progress = ProgressBar.create(title: "Processing module index", total: total_pages, format: "%t (%c/%u): |%B|")
+
+    modules_to_download = []
+
+    index_hydra = Typhoeus::Hydra.new(max_concurrency: options[:concurrency])
+    total_pages.times do |page, memo|
+      offset = page * MODULE_PAGE_SIZE
+      request = Typhoeus::Request.new(forge_uri.merge("/v3/modules?limit=#{MODULE_PAGE_SIZE}&offset=#{offset}"))
+      request.on_complete do |response|
+        modules_to_download << JSON.parse(response.body)["results"]
+        index_progress.increment
+      end
+      index_hydra.queue(request)
+    end
+    index_hydra.run
+
+    download_progress = ProgressBar.create(title: "Downloading modules", total: modules_to_download.flatten.count, format: "%t (%c/%u): |%B|")
+    download_hydra = Typhoeus::Hydra.new(max_concurrency: options[:concurrency])
+    modules_to_download.flatten.each do |module_data|
+      owner, name = module_data["owner"]["slug"], module_data["name"]
+      file_uri = module_data["current_release"]["file_uri"]
+      file_name = File.basename(file_uri)
+      sha256 = module_data["current_release"]["file_sha256"]
+      download_path = File.join(download_dir, owner, name, file_name)
+
+      if File.exist?(download_path)
+        download_progress.increment
+        next
+      end
+
+      FileUtils.mkdir_p(File.dirname(download_path))
+      download_url = "#{options[:source]}#{module_data["current_release"]["file_uri"]}"
+      request = Typhoeus::Request.new(download_url)
+      request.on_complete do |response|
+        if response.success?
+          File.binwrite(download_path, response.body)
+
+          if sha256 != Digest::SHA256.file(download_path).to_s
+            puts "SHA256 checksum mismatch for #{owner}/#{name}/#{file_name}. Deleting corrupted file."
+            File.delete(download_path)
+          end
+        else
+          puts "Failed to download #{owner}/#{name}/#{file_name}."
+        end
+        download_progress.increment
+      end
+      download_hydra.queue(request)
+    end
+
+    download_hydra.run
+    puts "Finished downloading."
+  end
+
+  default_command :mirror
+end
+
+PuppetForgeMirror.start(ARGV)
